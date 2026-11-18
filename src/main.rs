@@ -4,12 +4,64 @@
 //! call (elevated with `pkexec`), so it stays as stable as pacman itself.
 
 use eframe::egui::{self, Color32, RichText};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 const ACCENT: Color32 = Color32::from_rgb(47, 128, 237);
+
+/// Hand-picked apps from the official repos, shown on the Discover tab.
+const RECOMMENDED: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Internet & chat",
+        &[
+            ("firefox", "Fast, private web browser"),
+            ("thunderbird", "Email, calendar and contacts"),
+            ("telegram-desktop", "Telegram messenger"),
+            ("discord", "Voice and text chat"),
+            ("signal-desktop", "Private messenger"),
+            ("qbittorrent", "Torrent client"),
+        ],
+    ),
+    (
+        "Media",
+        &[
+            ("vlc", "Plays almost any video or audio file"),
+            ("mpv", "Minimal, powerful video player"),
+            ("obs-studio", "Screen recording and streaming"),
+            ("audacity", "Audio recorder and editor"),
+            ("kdenlive", "Video editor"),
+        ],
+    ),
+    (
+        "Creative",
+        &[
+            ("gimp", "Photo editing"),
+            ("krita", "Digital painting"),
+            ("inkscape", "Vector graphics"),
+            ("blender", "3D modelling and animation"),
+        ],
+    ),
+    (
+        "Office & tools",
+        &[
+            ("libreoffice-fresh", "Documents, spreadsheets, presentations"),
+            ("keepassxc", "Offline password manager"),
+            ("btop", "Pretty system monitor for the terminal"),
+        ],
+    ),
+    (
+        "Games",
+        &[
+            ("steam", "Game store and launcher"),
+            ("lutris", "Run games from other stores"),
+            ("mangohud", "FPS and performance overlay"),
+            ("gamemode", "Temporary performance boost while gaming"),
+        ],
+    ),
+];
 
 // ---------------------------------------------------------------- data ----
 
@@ -25,6 +77,7 @@ struct Pkg {
 enum Msg {
     Searched(Vec<Pkg>),
     Installed(Vec<Pkg>),
+    AllInstalled(HashSet<String>),
     Updates(Vec<Pkg>),
     Log(String),
     Done { ok: bool, label: String },
@@ -38,6 +91,7 @@ enum Tab {
     Updates,
 }
 
+#[derive(Clone, Copy)]
 enum Kind {
     Search,
     Installed,
@@ -75,6 +129,66 @@ fn capture(prog: &str, args: &[&str]) -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
+}
+
+/// Finds the user's default terminal: the freedesktop launcher if present,
+/// then KDE's setting, then $TERMINAL, then a list of common terminals.
+fn default_terminal() -> Option<String> {
+    if find_in_path("xdg-terminal-exec") {
+        return Some("xdg-terminal-exec".to_string());
+    }
+    let kde = capture(
+        "kreadconfig6",
+        &["--file", "kdeglobals", "--group", "General", "--key", "TerminalApplication"],
+    );
+    let kde = kde.trim();
+    if !kde.is_empty() && find_in_path(kde) {
+        return Some(kde.to_string());
+    }
+    if let Ok(t) = std::env::var("TERMINAL") {
+        if !t.is_empty() && find_in_path(&t) {
+            return Some(t);
+        }
+    }
+    [
+        "konsole",
+        "ghostty",
+        "gnome-terminal",
+        "kgx",
+        "kitty",
+        "alacritty",
+        "foot",
+        "wezterm",
+        "xfce4-terminal",
+        "xterm",
+    ]
+    .iter()
+    .find(|t| find_in_path(t))
+    .map(|t| t.to_string())
+}
+
+/// The flag each terminal needs before the command it should run.
+fn terminal_flags(term: &str) -> Vec<&'static str> {
+    match term {
+        "xdg-terminal-exec" | "kitty" | "foot" => vec![],
+        "gnome-terminal" => vec!["--"],
+        "xfce4-terminal" => vec!["-x"],
+        "wezterm" => vec!["start", "--"],
+        _ => vec!["-e"],
+    }
+}
+
+/// Opens an AUR install (paru/yay) in a terminal. Returns the terminal used.
+fn open_in_terminal(helper: &str, pkg: &str) -> Result<String, String> {
+    let term = default_terminal().ok_or("No terminal emulator found")?;
+    // The package name is passed as an argument, never spliced into the script.
+    let script = "\"$0\" -S \"$1\"; echo; printf 'Press Enter to close...'; read _";
+    Command::new(&term)
+        .args(terminal_flags(&term))
+        .args(["sh", "-c", script, helper, pkg])
+        .spawn()
+        .map(|_| term.clone())
+        .map_err(|e| format!("Could not start {term}: {e}"))
 }
 
 /// Parses `pacman -Ss` style output:
@@ -162,6 +276,9 @@ fn spawn_installed(tx: Sender<Msg>, ctx: egui::Context) {
     thread::spawn(move || {
         let out = capture("pacman", &["--color", "never", "-Qe"]);
         let _ = tx.send(Msg::Installed(parse_installed(&out)));
+        let all = capture("pacman", &["-Qq"]);
+        let set: HashSet<String> = all.lines().map(|l| l.trim().to_string()).collect();
+        let _ = tx.send(Msg::AllInstalled(set));
         ctx.request_repaint();
     });
 }
@@ -234,6 +351,7 @@ struct Stash {
     filter: String,
     results: Vec<Pkg>,
     installed: Vec<Pkg>,
+    all_installed: HashSet<String>,
     updates: Vec<Pkg>,
     searching: bool,
     busy: Option<String>,
@@ -280,6 +398,7 @@ impl Stash {
             filter: String::new(),
             results: Vec::new(),
             installed: Vec::new(),
+            all_installed: HashSet::new(),
             updates: Vec::new(),
             searching: false,
             busy: None,
@@ -320,6 +439,7 @@ impl Stash {
                 self.searching = false;
             }
             Msg::Installed(v) => self.installed = v,
+            Msg::AllInstalled(s) => self.all_installed = s,
             Msg::Updates(v) => self.updates = v,
             Msg::Log(s) => {
                 self.log.push_str(&s);
@@ -362,12 +482,9 @@ impl Stash {
                 if p.repo == "aur" {
                     match self.aur.clone() {
                         Some(helper) => {
-                            let r = Command::new("konsole")
-                                .args(["-e", helper.as_str(), "-S", p.name.as_str()])
-                                .spawn();
-                            self.status = match r {
-                                Ok(_) => "Opened a terminal for the AUR install. Press Refresh when it finishes".into(),
-                                Err(e) => format!("Could not open Konsole: {e}"),
+                            self.status = match open_in_terminal(&helper, &p.name) {
+                                Ok(t) => format!("Opened {t} for the AUR install. Press Refresh when it finishes"),
+                                Err(e) => e,
                             };
                         }
                         None => self.status = "Install paru or yay to use AUR packages".into(),
@@ -392,62 +509,96 @@ impl Stash {
     }
 }
 
+fn pkg_card(ui: &mut egui::Ui, p: &Pkg, kind: Kind, busy: bool) -> Option<Action> {
+    let mut action = None;
+    egui::Frame::group(ui.style())
+        .rounding(10.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let left = (ui.available_width() - 120.0).max(120.0);
+                ui.allocate_ui(egui::vec2(left, 0.0), |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&p.name).strong().size(16.0));
+                            ui.label(RichText::new(&p.version).weak());
+                            if p.repo == "aur" {
+                                ui.label(RichText::new("AUR").small().color(ACCENT));
+                            }
+                        });
+                        if !p.desc.is_empty() {
+                            ui.label(&p.desc);
+                        }
+                    });
+                });
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| match kind {
+                        Kind::Search => {
+                            if p.installed {
+                                ui.add_enabled(false, egui::Button::new("Installed"));
+                            } else {
+                                let b = egui::Button::new(
+                                    RichText::new("Install").color(Color32::WHITE),
+                                )
+                                .fill(ACCENT);
+                                if ui.add_enabled(!busy, b).clicked() {
+                                    action = Some(Action::Install(p.clone()));
+                                }
+                            }
+                        }
+                        Kind::Installed => {
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("Remove"))
+                                .clicked()
+                            {
+                                action = Some(Action::Remove(p.name.clone()));
+                            }
+                        }
+                        Kind::Updates => {}
+                    },
+                );
+            });
+        });
+    action
+}
+
 fn pkg_list(ui: &mut egui::Ui, pkgs: &[Pkg], kind: Kind, busy: bool) -> Option<Action> {
     let mut action = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for p in pkgs {
-                egui::Frame::group(ui.style())
-                    .rounding(10.0)
-                    .inner_margin(12.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let left = (ui.available_width() - 120.0).max(120.0);
-                            ui.allocate_ui(egui::vec2(left, 0.0), |ui| {
-                                ui.vertical(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new(&p.name).strong().size(16.0));
-                                        ui.label(RichText::new(&p.version).weak());
-                                        if p.repo == "aur" {
-                                            ui.label(RichText::new("AUR").small().color(ACCENT));
-                                        }
-                                    });
-                                    if !p.desc.is_empty() {
-                                        ui.label(&p.desc);
-                                    }
-                                });
-                            });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| match kind {
-                                    Kind::Search => {
-                                        if p.installed {
-                                            ui.add_enabled(false, egui::Button::new("Installed"));
-                                        } else {
-                                            let b = egui::Button::new(
-                                                RichText::new("Install").color(Color32::WHITE),
-                                            )
-                                            .fill(ACCENT);
-                                            if ui.add_enabled(!busy, b).clicked() {
-                                                action = Some(Action::Install(p.clone()));
-                                            }
-                                        }
-                                    }
-                                    Kind::Installed => {
-                                        if ui
-                                            .add_enabled(!busy, egui::Button::new("Remove"))
-                                            .clicked()
-                                        {
-                                            action = Some(Action::Remove(p.name.clone()));
-                                        }
-                                    }
-                                    Kind::Updates => {}
-                                },
-                            );
-                        });
-                    });
+                if let Some(a) = pkg_card(ui, p, kind, busy) {
+                    action = Some(a);
+                }
+            }
+        });
+    action
+}
+
+fn recommended_ui(ui: &mut egui::Ui, all_installed: &HashSet<String>, busy: bool) -> Option<Action> {
+    let mut action = None;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Recommended").strong().size(18.0));
+            for (category, items) in RECOMMENDED {
+                ui.add_space(6.0);
+                ui.label(RichText::new(*category).weak());
+                for (name, desc) in items.iter() {
+                    let p = Pkg {
+                        repo: "extra".to_string(),
+                        name: name.to_string(),
+                        version: String::new(),
+                        desc: desc.to_string(),
+                        installed: all_installed.contains(*name),
+                    };
+                    if let Some(a) = pkg_card(ui, &p, Kind::Search, busy) {
+                        action = Some(a);
+                    }
+                }
             }
         });
     action
@@ -540,12 +691,12 @@ impl eframe::App for Stash {
                         ui.spinner();
                         ui.label("Searching…");
                     });
-                } else if self.results.is_empty() {
-                    if self.query.trim().is_empty() {
-                        empty_state(ui, "Type a name and press Enter to find something to install");
-                    } else {
-                        empty_state(ui, "No results");
+                } else if self.query.trim().is_empty() {
+                    if let Some(a) = recommended_ui(ui, &self.all_installed, busy) {
+                        action = Some(a);
                     }
+                } else if self.results.is_empty() {
+                    empty_state(ui, "No results");
                 } else if let Some(a) = pkg_list(ui, &self.results, Kind::Search, busy) {
                     action = Some(a);
                 }
