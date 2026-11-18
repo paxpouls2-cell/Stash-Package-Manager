@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Stash
+GenericName=Package Manager
+Comment=Find and install apps
+Exec=stash
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;
+StartupWMClass=stash
